@@ -1,12 +1,20 @@
 #![no_std]
 #![allow(deprecated)]
 use nbbs_shared::DEXError;
-use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, IntoVal, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, vec, xdr::ToXdr, Address, Bytes, BytesN, Env, IntoVal,
+    Symbol, Vec,
+};
 
 /// Issue #188: versioned-interface convention. Bump on a breaking storage
 /// layout or interface change; see docs/upgrade-migrations.md.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Bond held in quote-asset minor units while a purchase is committed.
+pub const PURCHASE_COMMIT_BOND: i128 = 1_000;
+/// A committed purchase must be revealed after one ledger and within twenty.
+pub const PURCHASE_REVEAL_DELAY: u32 = 1;
+pub const PURCHASE_REVEAL_WINDOW: u32 = 20;
 
 #[derive(Clone)]
 #[contracttype]
@@ -21,6 +29,19 @@ pub enum DataKey {
     Balance(Symbol, Address),
     BondEscrow(u64, Address),
     Nonce(Address),
+    PurchaseCommit(u64),
+    PurchaseCommitCount,
+    PenaltyBalance(Symbol),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct PurchaseCommit {
+    pub buyer: Address,
+    pub commitment: BytesN<32>,
+    pub quote_asset: Symbol,
+    pub ledger_sequence: u32,
+    pub revealed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -118,6 +139,18 @@ fn is_order_expired(env: &Env, order: &Order) -> bool {
     env.ledger().timestamp() >= order.expires_at
 }
 
+fn commitment_hash(
+    env: &Env,
+    buyer: &Address,
+    order_id: u64,
+    max_price: i128,
+    amount: i128,
+    salt: &BytesN<32>,
+) -> BytesN<32> {
+    let preimage: Bytes = (buyer.clone(), order_id, max_price, amount, salt.clone()).to_xdr(env);
+    env.crypto().sha256(&preimage)
+}
+
 /// Persist `Expired` on an open/partial order that has passed its deadline.
 /// Used by the batched `clean_expired_orders` sweep.
 fn mark_order_expired(env: &Env, order_id: u64, mut order: Order) -> Order {
@@ -211,9 +244,193 @@ impl DEXRouter {
         SCHEMA_VERSION
     }
 
-
     pub fn get_nonce(env: Env, address: Address) -> u64 {
         get_nonce(&env, &address)
+    }
+
+    /// Return the sealed purchase digest to build a commit off-chain. The
+    /// buyer, order, price cap, amount and random salt are all bound to it.
+    pub fn purchase_commitment(
+        env: Env,
+        buyer: Address,
+        order_id: u64,
+        max_price: i128,
+        amount: i128,
+        salt: BytesN<32>,
+    ) -> BytesN<32> {
+        commitment_hash(&env, &buyer, order_id, max_price, amount, &salt)
+    }
+
+    /// Lock a fixed quote-asset bond while the caller's purchase remains
+    /// hidden. Reveal occurs in a later ledger to prevent same-ledger ordering
+    /// from exposing the order before inclusion.
+    pub fn commit_purchase(
+        env: Env,
+        buyer: Address,
+        commitment: BytesN<32>,
+        quote_asset: Symbol,
+        nonce: u64,
+    ) -> Result<u64, DEXError> {
+        buyer.require_auth();
+        let expected_nonce = get_nonce(&env, &buyer);
+        if nonce != expected_nonce {
+            return Err(DEXError::InvalidNonce);
+        }
+        set_nonce(&env, &buyer, expected_nonce + 1);
+
+        let balance = get_balance(&env, &buyer, &quote_asset);
+        if balance < PURCHASE_COMMIT_BOND {
+            return Err(DEXError::InsufficientFunds);
+        }
+        set_balance(&env, &buyer, &quote_asset, balance - PURCHASE_COMMIT_BOND);
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PurchaseCommitCount)
+            .unwrap_or(0);
+        let commit_id = count.checked_add(1).ok_or(DEXError::Overflow)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::PurchaseCommitCount, &commit_id);
+        let purchase_commit = PurchaseCommit {
+            buyer: buyer.clone(),
+            commitment,
+            quote_asset,
+            ledger_sequence: env.ledger().sequence(),
+            revealed: false,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::PurchaseCommit(commit_id), &purchase_commit);
+        env.events().publish(
+            (Symbol::new(&env, "purchase_committed"),),
+            (commit_id, buyer),
+        );
+        Ok(commit_id)
+    }
+
+    /// Reveal a committed purchase and settle at the listing's fixed price.
+    /// The bonded amount is refunded only after the commitment has been
+    /// verified and settlement succeeds.
+    pub fn reveal_purchase(
+        env: Env,
+        buyer: Address,
+        commit_id: u64,
+        order_id: u64,
+        max_price: i128,
+        amount: i128,
+        salt: BytesN<32>,
+        nonce: u64,
+    ) -> Result<(), DEXError> {
+        buyer.require_auth();
+        let expected_nonce = get_nonce(&env, &buyer);
+        if nonce != expected_nonce {
+            return Err(DEXError::InvalidNonce);
+        }
+        set_nonce(&env, &buyer, expected_nonce + 1);
+
+        let mut purchase_commit: PurchaseCommit = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PurchaseCommit(commit_id))
+            .ok_or(DEXError::OrderNotFound)?;
+        if purchase_commit.buyer != buyer || purchase_commit.revealed {
+            return Err(DEXError::Unauthorized);
+        }
+        let sequence = env.ledger().sequence();
+        let earliest = purchase_commit
+            .ledger_sequence
+            .checked_add(PURCHASE_REVEAL_DELAY)
+            .ok_or(DEXError::Overflow)?;
+        let deadline = purchase_commit
+            .ledger_sequence
+            .checked_add(PURCHASE_REVEAL_WINDOW)
+            .ok_or(DEXError::Overflow)?;
+        if sequence < earliest || sequence > deadline {
+            return Err(if sequence < earliest {
+                DEXError::RevealTooEarly
+            } else {
+                DEXError::RevealWindowClosed
+            });
+        }
+        if commitment_hash(&env, &buyer, order_id, max_price, amount, &salt)
+            != purchase_commit.commitment
+        {
+            return Err(DEXError::InvalidCommitment);
+        }
+        let order: Order = env
+            .storage()
+            .instance()
+            .get(&DataKey::Order(order_id))
+            .ok_or(DEXError::OrderNotFound)?;
+        if order.quote_asset != purchase_commit.quote_asset {
+            return Err(DEXError::InvalidCommitment);
+        }
+
+        purchase_commit.revealed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::PurchaseCommit(commit_id), &purchase_commit);
+        let balance = get_balance(&env, &buyer, &purchase_commit.quote_asset);
+        let refunded_balance = balance
+            .checked_add(PURCHASE_COMMIT_BOND)
+            .ok_or(DEXError::Overflow)?;
+        set_balance(&env, &buyer, &purchase_commit.quote_asset, refunded_balance);
+        let settlement_nonce = expected_nonce.checked_add(1).ok_or(DEXError::Overflow)?;
+        Self::execute_purchase(env, buyer, order_id, max_price, amount, settlement_nonce)
+    }
+
+    /// Forfeit an unrevealed commitment after its reveal window. Anyone may
+    /// call this bounded single-record cleanup; the locked bond is credited
+    /// to the contract's penalty reserve and cannot be reclaimed by the buyer.
+    pub fn forfeit_purchase_commit(env: Env, commit_id: u64) -> Result<(), DEXError> {
+        let mut purchase_commit: PurchaseCommit = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PurchaseCommit(commit_id))
+            .ok_or(DEXError::OrderNotFound)?;
+        if purchase_commit.revealed {
+            return Err(DEXError::OrderAlreadyFilled);
+        }
+        let deadline = purchase_commit
+            .ledger_sequence
+            .checked_add(PURCHASE_REVEAL_WINDOW)
+            .ok_or(DEXError::Overflow)?;
+        if env.ledger().sequence() <= deadline {
+            return Err(DEXError::RevealTooEarly);
+        }
+
+        purchase_commit.revealed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::PurchaseCommit(commit_id), &purchase_commit);
+        let reserve: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PenaltyBalance(
+                purchase_commit.quote_asset.clone(),
+            ))
+            .unwrap_or(0);
+        let new_reserve = reserve
+            .checked_add(PURCHASE_COMMIT_BOND)
+            .ok_or(DEXError::Overflow)?;
+        env.storage().persistent().set(
+            &DataKey::PenaltyBalance(purchase_commit.quote_asset.clone()),
+            &new_reserve,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "purchase_commit_forfeited"),),
+            (commit_id, purchase_commit.buyer, PURCHASE_COMMIT_BOND),
+        );
+        Ok(())
+    }
+
+    pub fn get_penalty_balance(env: Env, quote_asset: Symbol) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PenaltyBalance(quote_asset))
+            .unwrap_or(0)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -812,6 +1029,134 @@ mod test {
         assert_eq!(
             client.get_quote_balance(&seller, &Symbol::new(&env, "USDC")),
             100_000
+        );
+    }
+
+    #[test]
+    fn test_committed_purchase_hides_trade_until_reveal_and_refunds_bond() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_sequence_number(100);
+
+        let admin = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let (_issuer_admin, issuer_id, bond_id, seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+        let contract_id = env.register(DEXRouter, (admin, issuer_id, Address::generate(&env)));
+        let client = DEXRouterClient::new(&env, &contract_id);
+        let order_id = client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &100i128,
+            &100i128,
+            &Symbol::new(&env, "USDC"),
+            &3600u64,
+            &0,
+        );
+        client.deposit_quote(&buyer, &Symbol::new(&env, "USDC"), &20_000i128, &0);
+
+        let salt = BytesN::from_array(&env, &[7; 32]);
+        let commitment = client.purchase_commitment(&buyer, &order_id, &100i128, &100i128, &salt);
+        let commit_id = client.commit_purchase(&buyer, &commitment, &Symbol::new(&env, "USDC"), &1);
+        assert_eq!(
+            client.get_quote_balance(&buyer, &Symbol::new(&env, "USDC")),
+            19_000
+        );
+
+        env.ledger().set_sequence_number(101);
+        client.reveal_purchase(&buyer, &commit_id, &order_id, &100i128, &100i128, &salt, &2);
+
+        assert_eq!(client.get_order(&order_id).status, OrderStatus::Filled);
+        assert_eq!(
+            client.get_quote_balance(&buyer, &Symbol::new(&env, "USDC")),
+            9_000
+        );
+        assert_eq!(
+            client.get_quote_balance(&seller, &Symbol::new(&env, "USDC")),
+            10_000
+        );
+        assert_eq!(client.get_penalty_balance(&Symbol::new(&env, "USDC")), 0);
+    }
+
+    #[test]
+    fn test_unrevealed_purchase_commit_is_slashed_after_window() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_sequence_number(100);
+        let admin = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let (_issuer_admin, issuer_id, _bond_id, _seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+        let contract_id = env.register(DEXRouter, (admin, issuer_id, Address::generate(&env)));
+        let client = DEXRouterClient::new(&env, &contract_id);
+        let quote_asset = Symbol::new(&env, "USDC");
+        client.deposit_quote(&buyer, &quote_asset, &2_000i128, &0);
+        let commitment = BytesN::from_array(&env, &[9; 32]);
+        let commit_id = client.commit_purchase(&buyer, &commitment, &quote_asset, &1);
+
+        env.ledger()
+            .set_sequence_number(100 + PURCHASE_REVEAL_WINDOW + 1);
+        client.forfeit_purchase_commit(&commit_id);
+
+        assert_eq!(
+            client.get_penalty_balance(&quote_asset),
+            PURCHASE_COMMIT_BOND
+        );
+        assert_eq!(client.get_quote_balance(&buyer, &quote_asset), 1_000);
+        assert_eq!(
+            client.try_forfeit_purchase_commit(&commit_id),
+            Err(Ok(DEXError::OrderAlreadyFilled))
+        );
+    }
+
+    #[test]
+    fn test_purchase_commit_rejects_early_and_invalid_reveals() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_sequence_number(100);
+        let admin = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let (_issuer_admin, issuer_id, bond_id, seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+        let contract_id = env.register(DEXRouter, (admin, issuer_id, Address::generate(&env)));
+        let client = DEXRouterClient::new(&env, &contract_id);
+        let order_id = client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &100i128,
+            &100i128,
+            &Symbol::new(&env, "USDC"),
+            &3600u64,
+            &0,
+        );
+        let quote_asset = Symbol::new(&env, "USDC");
+        client.deposit_quote(&buyer, &quote_asset, &20_000i128, &0);
+        let salt = BytesN::from_array(&env, &[3; 32]);
+        let commitment = client.purchase_commitment(&buyer, &order_id, &100i128, &100i128, &salt);
+        let commit_id = client.commit_purchase(&buyer, &commitment, &quote_asset, &1);
+
+        assert_eq!(
+            client
+                .try_reveal_purchase(&buyer, &commit_id, &order_id, &100i128, &100i128, &salt, &2,),
+            Err(Ok(DEXError::RevealTooEarly))
+        );
+        env.ledger().set_sequence_number(101);
+        let wrong_salt = BytesN::from_array(&env, &[4; 32]);
+        assert_eq!(
+            client.try_reveal_purchase(
+                &buyer,
+                &commit_id,
+                &order_id,
+                &100i128,
+                &100i128,
+                &wrong_salt,
+                &2,
+            ),
+            Err(Ok(DEXError::InvalidCommitment))
+        );
+        assert_eq!(
+            client.get_quote_balance(&buyer, &quote_asset),
+            20_000 - PURCHASE_COMMIT_BOND
         );
     }
 

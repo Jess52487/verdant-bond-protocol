@@ -69,6 +69,9 @@ pub enum DEXError {
     ZeroAmount = 9,
     InsufficientFunds = 10,
     Overflow = 11,
+    InvalidCommitment = 12,
+    RevealTooEarly = 13,
+    RevealWindowClosed = 14,
 }
 
 #[derive(Clone, Debug, PartialEq)]
