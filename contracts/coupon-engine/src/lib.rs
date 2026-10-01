@@ -903,22 +903,6 @@ impl CouponEngine {
         let mut total_holder_credits: i128 = 0;
         let mut holder_count: u32 = 0;
 
-        let credits_per_token = if total_subscribed > 0 && total_credits > 0 {
-            checked_ratio(total_credits, FIXED_POINT, total_subscribed)?
-        } else {
-            0
-        };
-        let carbon_per_token = if total_subscribed > 0 && carbon_total > 0 {
-            checked_ratio(carbon_total, FIXED_POINT, total_subscribed)?
-        } else {
-            0
-        };
-        let biodiversity_per_token = if total_subscribed > 0 && biodiversity_total > 0 {
-            checked_ratio(biodiversity_total, FIXED_POINT, total_subscribed)?
-        } else {
-            0
-        };
-
         let holder_len = holders.len();
         if limit > MAX_COUPON_BATCH_SIZE || offset > holder_len {
             return Err(BondError::Overflow);
@@ -953,7 +937,7 @@ impl CouponEngine {
                 match credit_type {
                     CreditType::Carbon | CreditType::BlueCarbon => {
                         let holder_credits =
-                            checked_ratio(credits_per_token, balance, FIXED_POINT)?;
+                            checked_ratio(total_credits, balance, total_subscribed)?;
                         if holder_credits > 0 {
                             total_holder_credits = total_holder_credits
                                 .checked_add(holder_credits)
@@ -971,7 +955,7 @@ impl CouponEngine {
                     }
                     CreditType::Biodiversity => {
                         let holder_credits =
-                            checked_ratio(credits_per_token, balance, FIXED_POINT)?;
+                            checked_ratio(total_credits, balance, total_subscribed)?;
                         if holder_credits > 0 {
                             total_holder_credits = total_holder_credits
                                 .checked_add(holder_credits)
@@ -988,9 +972,9 @@ impl CouponEngine {
                         }
                     }
                     CreditType::Basket => {
-                        let carbon_holder = checked_ratio(carbon_per_token, balance, FIXED_POINT)?;
+                        let carbon_holder = checked_ratio(carbon_total, balance, total_subscribed)?;
                         let biodiversity_holder =
-                            checked_ratio(biodiversity_per_token, balance, FIXED_POINT)?;
+                            checked_ratio(biodiversity_total, balance, total_subscribed)?;
                         let holder_credits = carbon_holder
                             .checked_add(biodiversity_holder)
                             .ok_or(BondError::Overflow)?;
@@ -2697,9 +2681,8 @@ mod test {
         assert_eq!(result.holder_count, 2);
 
         let total_sub = 10000i128;
-        let credits_per_token = total_credits * FIXED_POINT / total_sub;
-        let expected_h1 = credits_per_token * 3000 / FIXED_POINT;
-        let expected_h2 = credits_per_token * 7000 / FIXED_POINT;
+        let expected_h1 = total_credits * 3000 / total_sub;
+        let expected_h2 = total_credits * 7000 / total_sub;
 
         assert_eq!(t.client.accrued_credits(&bond_id, &holder1), expected_h1);
         assert_eq!(t.client.accrued_credits(&bond_id, &holder2), expected_h2);
@@ -3059,8 +3042,7 @@ mod test {
             .distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1);
 
         let total = 100 * CREDIT_MINOR_UNITS;
-        let credits_per_token = total * FIXED_POINT / 3;
-        let per_holder = credits_per_token / FIXED_POINT; // each holder holds 1 token
+        let per_holder = total / 3; // each holder holds 1 of 3 tokens
         let distributed = per_holder * 3;
         assert_eq!(result.total_credits, distributed);
 
@@ -3874,8 +3856,7 @@ mod test {
             if total_subscribed <= 0 || total_credits <= 0 {
                 return 0;
             }
-            let credits_per_token = total_credits * FIXED_POINT / total_subscribed;
-            credits_per_token * balance / FIXED_POINT
+            total_credits * balance / total_subscribed
         }
 
         fn deploy_with_holders(
@@ -4111,6 +4092,37 @@ mod test {
                     details.get(1).unwrap().amount
                 );
             }
+        }
+
+        #[test]
+        fn full_supply_holder_receives_pool_without_double_rounding() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let admin = Address::generate(&env);
+            let max_supply = nbbs_bond_issuer::MAX_SUPPLY;
+            let (t, holders, bond_id, total_subscribed) =
+                deploy_typed(env, admin, CreditType::Carbon, &[max_supply], 0);
+            let carbon = 999_999_999_999_000i128;
+            let report_id = submit_verified_report(
+                &t._env,
+                &t,
+                &create_project_id(&t._env, 7),
+                carbon,
+                BiodiversityMetrics::Absent,
+                0,
+            );
+            let holder_vec = Vec::from_array(&t._env, [holders[0].clone()]);
+            let result =
+                t.client
+                    .distribute_coupon(&t.admin, &bond_id, &0, &holder_vec, &report_id, &1);
+
+            let pool = carbon / CREDIT_DIVISOR * CREDIT_MINOR_UNITS;
+            assert_eq!(pool, MAX_COUPON_POOL - CREDIT_MINOR_UNITS);
+            assert_eq!(t.client.accrued_credits(&bond_id, &holders[0]), pool);
+            assert_eq!(result.total_credits, pool);
+            assert_eq!(t.client.get_undistributed_total(&bond_id), 0);
+            let double_rounded = (pool * FIXED_POINT / total_subscribed) * max_supply / FIXED_POINT;
+            assert!(double_rounded < pool);
         }
 
         proptest! {

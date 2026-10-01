@@ -1090,9 +1090,8 @@ mod integration {
                 .distribute_coupon(&admin, &bond_id, &0, &holders, &report_id, &1);
 
             let total = 100 * nbbs_coupon_engine::CREDIT_MINOR_UNITS;
-            let credits_per_token = total * nbbs_coupon_engine::FIXED_POINT / 3;
             // each holder holds 1 token
-            let per_holder = credits_per_token / nbbs_coupon_engine::FIXED_POINT;
+            let per_holder = total / 3;
             let distributed = per_holder * 3;
 
             assert_eq!(result.total_credits, distributed);
@@ -1680,12 +1679,7 @@ mod integration {
 
                 let mut distributed = 0i128;
                 for (holder, &amount) in holders.iter().zip(balances.iter()) {
-                    let cpt = if total_credits > 0 {
-                        total_credits * nbbs_coupon_engine::FIXED_POINT / total_subscribed
-                    } else {
-                        0
-                    };
-                    let expected = cpt * amount / nbbs_coupon_engine::FIXED_POINT;
+                    let expected = total_credits * amount / total_subscribed;
                     let accrued = contracts.ce_client.accrued_credits(&bond_id, holder);
                     prop_assert_eq!(accrued, expected);
                     distributed += expected;
